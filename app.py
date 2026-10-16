@@ -1,14 +1,28 @@
 import streamlit as st
 import time
 import re
+import os
 from collections import deque
 
 # ---- set_page_config MUST be first ----
 st.set_page_config(page_title="Scenario Planner", page_icon="🗺️", layout="wide")
 
-# ---- Theme after config ----
+# ---- Theme ----
 from neonui import apply_theme
 apply_theme("cosmic_purple")
+
+# ---- Gemma 4 client (reads key from environment) ----
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+gemma_client = None
+gemma_ready = False
+
+if GEMINI_API_KEY:
+    try:
+        from google import genai
+        gemma_client = genai.Client(api_key=GEMINI_API_KEY)
+        gemma_ready = True
+    except Exception:
+        gemma_ready = False
 
 st.title("🗺️ Scenario Planner")
 st.write("*Type a scenario. See its parts. Change one thing. Watch the ripple.*")
@@ -163,12 +177,39 @@ KEYWORDS = {
 }
 
 # ============================================================
-# MATCHING (word boundaries)
+# GEMMA 4 — scenario matching
 # ============================================================
-def match_scenario(text):
+def match_with_gemma(text):
+    """Ask Gemma 4 which template fits. Returns template key or None."""
+    if not gemma_ready:
+        return None
+    try:
+        prompt = (
+            f'Classify this scenario into ONE of these categories: '
+            f'college fest, wedding, hackathon, startup, exam, generic.\n\n'
+            f'Scenario: "{text}"\n\n'
+            f'Reply with ONLY the category name, lowercase, nothing else.'
+        )
+        response = gemma_client.models.generate_content(
+            model="gemma-3-27b-it",
+            contents=prompt,
+        )
+        result = response.text.strip().lower()
+        result = re.sub(r"[^a-z ]", "", result).strip()
+        for key in TEMPLATES:
+            if key in result:
+                return key
+        return None
+    except Exception:
+        return None
+
+# ============================================================
+# KEYWORD FALLBACK
+# ============================================================
+def match_with_keywords(text):
     text = " ".join(text.lower().strip().split())
     if not text:
-        return None, False
+        return None
     best_key, best_score = None, 0
     for key, words in KEYWORDS.items():
         for word in words:
@@ -176,12 +217,27 @@ def match_scenario(text):
             if re.search(pattern, text) and len(word) > best_score:
                 best_score = len(word)
                 best_key = key
-    if best_key:
-        return TEMPLATES[best_key], True
-    return GENERIC, False
+    return best_key
+
+def match_scenario(text):
+    """Returns (template, is_known, source)."""
+    if not text.strip():
+        return None, False, "none"
+
+    key = match_with_gemma(text)
+    source = "gemma"
+
+    if not key:
+        key = match_with_keywords(text)
+        source = "keywords"
+
+    if key:
+        return TEMPLATES[key], True, source
+
+    return GENERIC, False, "fallback"
 
 # ============================================================
-# DIRECT IMPACT
+# IMPACT
 # ============================================================
 def find_direct_affected(change, components):
     c = change.lower()
@@ -219,9 +275,6 @@ def find_direct_affected(change, components):
 
     return matches
 
-# ============================================================
-# RIPPLE TRAVERSAL
-# ============================================================
 def trace_ripple(direct_affected, links):
     graph = {}
     for src, dst in links:
@@ -301,6 +354,14 @@ def set_scenario(value):
     st.session_state.change_input = ""
 
 # ============================================================
+# AI STATUS BADGE
+# ============================================================
+if gemma_ready:
+    st.success("🤖 Gemma 4 connected — scenario matching is AI-powered")
+else:
+    st.info("ℹ️ Running in rule-based mode. Set `GEMINI_API_KEY` to enable Gemma 4.")
+
+# ============================================================
 # INPUT
 # ============================================================
 st.subheader("1️⃣ Describe your scenario")
@@ -335,13 +396,13 @@ for i, ex in enumerate(examples):
 if build and not scenario.strip():
     st.warning("Please enter a scenario first.")
 elif (build or st.session_state.trigger_build) and scenario.strip():
-    template, is_known = match_scenario(scenario)
-    with st.spinner("Building your map..."):
-        time.sleep(0.4)
+    with st.spinner("Understanding your scenario..."):
+        template, is_known, source = match_scenario(scenario)
     st.session_state.result = {
         "input": scenario.strip(),
         "template": template,
         "is_known": is_known,
+        "source": source,
         "change": None,
         "direct": None,
         "affected": None,
@@ -358,17 +419,18 @@ if st.session_state.result:
     st.divider()
     st.subheader(f"2️⃣ Map: {t['label']}")
 
-    if r["is_known"]:
-        st.caption(f"Input: *{r['input']}*  •  ✅ Matched template")
-    else:
-        st.caption(f"Input: *{r['input']}*  •  🔧 Generic fallback (no template matched)")
+    source_labels = {
+        "gemma":    "🤖 Matched by Gemma 4",
+        "keywords": "🔍 Matched by keywords",
+        "fallback": "🔧 Generic fallback",
+        "none":     "—",
+    }
+    st.caption(f"Input: *{r['input']}*  •  {source_labels.get(r['source'], '—')}")
 
-    # Graph
     st.markdown("### 🕸️ Dependency Map")
     st.caption("Arrow = source influences target. Red = impacted after change.")
     render_graph(t["components"], t["links"], affected=r.get("affected") or [])
 
-    # Component cards
     st.markdown("### 🧩 Components")
     st.caption("Add owners, set status, and jot notes — it persists during the session.")
 
@@ -435,7 +497,7 @@ if st.session_state.result:
             st.warning("Type a change first.")
         else:
             with st.spinner("Tracing the ripple through dependencies..."):
-                time.sleep(0.6)
+                time.sleep(0.5)
             direct, affected = find_affected(
                 change, t["components"], t["links"]
             )
@@ -476,7 +538,7 @@ if st.session_state.result:
                 if comp["name"] in downstream:
                     st.write(f"　↳ then **{comp['name']}** broke")
 
-        # ---- SIMPLIFIED RECOVERY PLAN ----
+        # Simplified recovery plan
         st.markdown("### 🛠️ What to do now")
 
         direct_list = ", ".join(direct) if direct else "the broken parts"
